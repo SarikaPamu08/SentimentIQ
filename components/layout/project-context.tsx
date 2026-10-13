@@ -3,6 +3,7 @@
 import * as React from 'react';
 import { Project, SocialPost, AIInsightReport, SentimentStats } from '@/types/sentiment';
 import { SAMPLE_PROJECT, SAMPLE_POSTS, SAMPLE_INSIGHT_REPORT } from '@/lib/sample-data';
+import { createClient } from '@/lib/supabase/client';
 
 interface ProjectContextType {
   projects: Project[];
@@ -25,6 +26,8 @@ interface ProjectContextType {
   loadDemoData: () => void;
   clearDemoData: () => void;
   stats: SentimentStats;
+  user: any | null;
+  signOut: () => Promise<void>;
 }
 
 const ProjectContext = React.createContext<ProjectContextType | undefined>(undefined);
@@ -37,6 +40,81 @@ export function ProjectProvider({ children }: { children: React.ReactNode }) {
   const [isDemoMode, setIsDemoMode] = React.useState<boolean>(true);
   const [isAnalyzingBatch, setIsAnalyzingBatch] = React.useState<boolean>(false);
   const [isGeneratingInsights, setIsGeneratingInsights] = React.useState<boolean>(false);
+  const [user, setUser] = React.useState<any | null>(null);
+
+  // Sync with Supabase on mount
+  React.useEffect(() => {
+    async function initSupabase() {
+      try {
+        const supabase = createClient();
+        const { data: { user: currentUser } } = await supabase.auth.getUser();
+        if (currentUser) {
+          setUser(currentUser);
+          setIsDemoMode(false);
+
+          // Fetch user's projects
+          const { data: dbProjects } = await supabase
+            .from('projects')
+            .select('*')
+            .order('created_at', { ascending: false });
+
+          if (dbProjects && dbProjects.length > 0) {
+            setProjects(dbProjects);
+            setCurrentProject(dbProjects[0]);
+          } else {
+            setProjects([]);
+            setCurrentProject(null);
+          }
+        }
+      } catch (err) {
+        console.log('Running in local/demo mode (Supabase connection not active):', err);
+      }
+    }
+
+    initSupabase();
+  }, []);
+
+  // Fetch posts when currentProject changes if authenticated
+  React.useEffect(() => {
+    async function fetchProjectPosts() {
+      if (!currentProject || isDemoMode || !user) return;
+
+      try {
+        const supabase = createClient();
+        const { data: dbPosts, error } = await supabase
+          .from('posts')
+          .select(`
+            *,
+            sentiment_analyses (*)
+          `)
+          .eq('project_id', currentProject.id)
+          .order('published_at', { ascending: false });
+
+        if (!error && dbPosts) {
+          const mapped: SocialPost[] = dbPosts.map((p: any) => ({
+            id: p.id,
+            project_id: p.project_id,
+            user_id: p.user_id,
+            content: p.content,
+            platform: p.platform,
+            author: p.author,
+            post_url: p.post_url,
+            published_at: p.published_at,
+            status: p.status,
+            error_message: p.error_message,
+            created_at: p.created_at,
+            updated_at: p.updated_at,
+            analysis: p.sentiment_analyses?.[0] || p.sentiment_analyses || null,
+          }));
+          setPosts(mapped);
+        }
+      } catch (err) {
+        console.error('Error fetching project posts from Supabase:', err);
+      }
+    }
+
+    fetchProjectPosts();
+  }, [currentProject, isDemoMode, user]);
 
   // Calculate live statistics from posts belonging to current project
   const projectPosts = React.useMemo(() => {
@@ -93,9 +171,35 @@ export function ProjectProvider({ children }: { children: React.ReactNode }) {
     brand_or_topic: string;
     keywords: string[];
   }): Promise<Project> => {
+    if (user && !isDemoMode) {
+      try {
+        const supabase = createClient();
+        const { data: created, error } = await supabase
+          .from('projects')
+          .insert({
+            user_id: user.id,
+            name: data.name,
+            description: data.description || null,
+            brand_or_topic: data.brand_or_topic,
+            keywords: data.keywords,
+          })
+          .select()
+          .single();
+
+        if (!error && created) {
+          setProjects((prev) => [created, ...prev]);
+          setCurrentProject(created);
+          return created;
+        }
+      } catch (err) {
+        console.error('Supabase project creation failed:', err);
+      }
+    }
+
+    // Local / Demo state fallback
     const newProj: Project = {
       id: `proj-${Date.now()}`,
-      user_id: 'user-default',
+      user_id: user?.id || 'demo-user-id',
       name: data.name,
       description: data.description || null,
       brand_or_topic: data.brand_or_topic,
@@ -109,6 +213,15 @@ export function ProjectProvider({ children }: { children: React.ReactNode }) {
   };
 
   const deleteProject = async (id: string) => {
+    if (user && !isDemoMode) {
+      try {
+        const supabase = createClient();
+        await supabase.from('projects').delete().eq('id', id);
+      } catch (err) {
+        console.error('Supabase project deletion error:', err);
+      }
+    }
+
     setProjects((prev) => prev.filter((p) => p.id !== id));
     setPosts((prev) => prev.filter((p) => p.project_id !== id));
     if (currentProject?.id === id) {
@@ -120,6 +233,33 @@ export function ProjectProvider({ children }: { children: React.ReactNode }) {
   const addPost = async (
     postData: Omit<SocialPost, 'id' | 'created_at' | 'updated_at' | 'status'>
   ) => {
+    if (user && !isDemoMode) {
+      try {
+        const supabase = createClient();
+        const { data: created, error } = await supabase
+          .from('posts')
+          .insert({
+            project_id: postData.project_id,
+            user_id: user.id,
+            content: postData.content,
+            platform: postData.platform,
+            author: postData.author,
+            post_url: postData.post_url,
+            published_at: postData.published_at,
+            status: 'pending',
+          })
+          .select()
+          .single();
+
+        if (!error && created) {
+          setPosts((prev) => [created, ...prev]);
+          return;
+        }
+      } catch (err) {
+        console.error('Supabase add post error:', err);
+      }
+    }
+
     const newPost: SocialPost = {
       ...postData,
       id: `post-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
@@ -133,6 +273,34 @@ export function ProjectProvider({ children }: { children: React.ReactNode }) {
   const addPostsBulk = async (
     newPostsData: Omit<SocialPost, 'id' | 'created_at' | 'updated_at' | 'status'>[]
   ): Promise<number> => {
+    if (user && !isDemoMode && newPostsData.length > 0) {
+      try {
+        const supabase = createClient();
+        const payload = newPostsData.map((d) => ({
+          project_id: d.project_id,
+          user_id: user.id,
+          content: d.content,
+          platform: d.platform,
+          author: d.author,
+          post_url: d.post_url,
+          published_at: d.published_at,
+          status: 'pending',
+        }));
+
+        const { data: created, error } = await supabase
+          .from('posts')
+          .insert(payload)
+          .select();
+
+        if (!error && created) {
+          setPosts((prev) => [...created, ...prev]);
+          return created.length;
+        }
+      } catch (err) {
+        console.error('Supabase bulk insert error:', err);
+      }
+    }
+
     const created: SocialPost[] = newPostsData.map((data, idx) => ({
       ...data,
       id: `post-${Date.now()}-${idx}`,
@@ -145,6 +313,14 @@ export function ProjectProvider({ children }: { children: React.ReactNode }) {
   };
 
   const deletePost = async (id: string) => {
+    if (user && !isDemoMode) {
+      try {
+        const supabase = createClient();
+        await supabase.from('posts').delete().eq('id', id);
+      } catch (err) {
+        console.error('Supabase delete post error:', err);
+      }
+    }
     setPosts((prev) => prev.filter((p) => p.id !== id));
   };
 
@@ -153,10 +329,10 @@ export function ProjectProvider({ children }: { children: React.ReactNode }) {
       prev.map((p) => (p.id === id ? { ...p, status: 'processing' } : p))
     );
 
-    try {
-      const target = posts.find((p) => p.id === id);
-      if (!target) return;
+    const target = posts.find((p) => p.id === id);
+    if (!target) return;
 
+    try {
       const res = await fetch('/api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -167,75 +343,60 @@ export function ProjectProvider({ children }: { children: React.ReactNode }) {
         }),
       });
 
-      if (res.ok) {
-        const data = await res.json();
-        setPosts((prev) =>
-          prev.map((p) =>
-            p.id === id
-              ? {
-                  ...p,
-                  status: 'completed',
-                  analysis: {
-                    id: `ana-${Date.now()}`,
-                    post_id: id,
-                    sentiment: data.sentiment,
-                    sentiment_score: data.sentiment_score,
-                    confidence: data.confidence,
-                    emotions: data.emotions || [],
-                    keywords: data.keywords || [],
-                    explanation: data.explanation,
-                    language: data.language || 'en',
-                    sarcasm_detected: !!data.sarcasm_detected,
-                    created_at: new Date().toISOString(),
-                  },
-                }
-              : p
-          )
-        );
-      } else {
-        // Fallback local heuristic simulation if API keys are not yet configured in local environment
-        await new Promise((r) => setTimeout(r, 600));
-        const lower = target.content.toLowerCase();
-        const isNeg =
-          lower.includes('drained') ||
-          lower.includes('terrible') ||
-          lower.includes('frustrating') ||
-          lower.includes('broken') ||
-          lower.includes('drops');
-        const isPos =
-          lower.includes('phenomenal') ||
-          lower.includes('great') ||
-          lower.includes('impressive') ||
-          lower.includes('best') ||
-          lower.includes('love');
+      if (!res.ok) throw new Error('Analysis API error');
 
-        const sentiment = isNeg ? 'Negative' : isPos ? 'Positive' : 'Neutral';
-        const score = isNeg ? -0.7 : isPos ? 0.8 : 0.05;
+      const data = await res.json();
 
-        setPosts((prev) =>
-          prev.map((p) =>
-            p.id === id
-              ? {
-                  ...p,
-                  status: 'completed',
-                  analysis: {
-                    id: `ana-${Date.now()}`,
-                    post_id: id,
-                    sentiment,
-                    sentiment_score: score,
-                    confidence: 0.88,
-                    emotions: isNeg ? ['Frustration'] : isPos ? ['Joy'] : ['Neutral'],
-                    keywords: currentProject?.keywords.slice(0, 3) || ['feedback'],
-                    explanation: 'Classified based on contextual tone and intent.',
-                    language: 'en',
-                    sarcasm_detected: false,
-                    created_at: new Date().toISOString(),
-                  },
-                }
-              : p
-          )
-        );
+      const analysisObj = {
+        id: `ana-${Date.now()}`,
+        post_id: id,
+        sentiment: data.sentiment,
+        sentiment_score: data.sentiment_score,
+        confidence: data.confidence,
+        emotions: data.emotions || [],
+        keywords: data.keywords || [],
+        explanation: data.explanation,
+        language: data.language || 'en',
+        sarcasm_detected: !!data.sarcasm_detected,
+        created_at: new Date().toISOString(),
+      };
+
+      // Persist in Supabase if live
+      if (user && !isDemoMode) {
+        try {
+          const supabase = createClient();
+          await supabase.from('sentiment_analyses').upsert({
+            post_id: id,
+            sentiment: data.sentiment,
+            sentiment_score: data.sentiment_score,
+            confidence: data.confidence,
+            emotions: data.emotions,
+            keywords: data.keywords,
+            explanation: data.explanation,
+            language: data.language,
+            sarcasm_detected: data.sarcasm_detected,
+          });
+
+          await supabase
+            .from('posts')
+            .update({ status: 'completed' })
+            .eq('id', id);
+        } catch (dbErr) {
+          console.error('Failed to persist analysis to Supabase:', dbErr);
+        }
       }
+
+      setPosts((prev) =>
+        prev.map((p) =>
+          p.id === id
+            ? {
+                ...p,
+                status: 'completed',
+                analysis: analysisObj,
+              }
+            : p
+        )
+      );
     } catch {
       setPosts((prev) =>
         prev.map((p) => (p.id === id ? { ...p, status: 'failed' } : p))
@@ -281,19 +442,35 @@ export function ProjectProvider({ children }: { children: React.ReactNode }) {
 
       if (res.ok) {
         const data = await res.json();
-        setInsightsReport(data.report);
-      } else {
-        // Fallback default report if API is not yet active
-        await new Promise((r) => setTimeout(r, 800));
-        setInsightsReport({
-          ...SAMPLE_INSIGHT_REPORT,
+        const report = {
+          ...data.report,
           id: `insight-${Date.now()}`,
           project_id: currentProject.id,
+          user_id: user?.id || 'demo-user-id',
+          post_count_analyzed: projectPosts.filter((p) => p.status === 'completed').length,
           created_at: new Date().toISOString(),
-        });
+        };
+
+        if (user && !isDemoMode) {
+          const supabase = createClient();
+          await supabase.from('ai_insights').insert({
+            project_id: currentProject.id,
+            user_id: user.id,
+            title: report.title,
+            summary: report.summary,
+            positive_themes: report.positive_themes,
+            negative_themes: report.negative_themes,
+            emerging_topics: report.emerging_topics,
+            recommendations: report.recommendations,
+            suggested_responses: report.suggested_responses,
+            post_count_analyzed: report.post_count_analyzed,
+          });
+        }
+
+        setInsightsReport(report);
       }
-    } catch {
-      setInsightsReport(SAMPLE_INSIGHT_REPORT);
+    } catch (err) {
+      console.error('Insights generation error:', err);
     } finally {
       setIsGeneratingInsights(false);
     }
@@ -313,6 +490,15 @@ export function ProjectProvider({ children }: { children: React.ReactNode }) {
     setPosts([]);
     setInsightsReport(null);
     setIsDemoMode(false);
+  };
+
+  const signOut = async () => {
+    try {
+      const supabase = createClient();
+      await supabase.auth.signOut();
+    } catch {}
+    setUser(null);
+    loadDemoData();
   };
 
   return (
@@ -338,6 +524,8 @@ export function ProjectProvider({ children }: { children: React.ReactNode }) {
         loadDemoData,
         clearDemoData,
         stats,
+        user,
+        signOut,
       }}
     >
       {children}
